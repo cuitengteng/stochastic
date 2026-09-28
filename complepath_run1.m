@@ -1,0 +1,244 @@
+% 三维哑铃域：u0=1/2，f=0，外边界为零 Dirichlet。
+% 固定 alpha=2、T=0.5，比较不同 beta 的 z=0 截面。
+num_mesh_x=20;
+num_mesh_y=20;
+num_mesh_z=9;
+x_grid=linspace(-1,1,num_mesh_x);
+y_grid=linspace(-1,1,num_mesh_y);
+if num_mesh_z==1
+    z_grid=0; % 单层起点，三维路径。
+else
+    z_grid=linspace(-1,1,num_mesh_z);
+end
+[X,Y,Z]=meshgrid(x_grid,y_grid,z_grid);
+grid_size=[size(X,1),size(X,2),size(X,3)];
+[~,iz]=min(abs(z_grid));
+x0=[X(:)';Y(:)';Z(:)'];
+N=size(x0,2);
+
+num_path=1000;
+beta_list=[0.2 0.4 0.8 1];
+alpha=2;
+T=0.5;
+dt=1e-3;
+epoch=10000;
+alpha1=2;
+n=3;
+u0=1/2;
+assert(all(beta_list>0 & beta_list<=1) && T>=0 && dt>0);
+assert(isscalar(alpha) && alpha>0 && alpha<=2);
+g=@(y,z) 0.2*y.^2+0.15*sin(2*pi*y);
+gp_y=@(y,z) 0.4*y+0.3*pi*cos(2*pi*y);
+gp_z=@(y,z) 0;
+
+% 与原 coupleshape3d 相同的点云和 alphaShape，一次构建后共用。
+shp=make_domain();
+inside_start=inShape(shp,x0(1,:),x0(2,:),x0(3,:));
+mask=reshape(inside_start,grid_size);
+solution=zeros(numel(beta_list),N);
+u_num=cell(1,numel(beta_list));
+r1=sqrt(2*n*dt);
+tic;
+for j=1:numel(beta_list)
+    beta=beta_list(j);
+    r=(dt*2^alpha*gamma(1+alpha/2)*gamma((n+alpha)/2)/gamma(n/2))^(1/alpha);
+    sol_time=zeros(N,1);
+    parfor k=1:N
+        if ~inside_start(k)
+            sol_time(k)=0;
+            continue;
+        end
+        sol_stoc_new=0;
+        near_interface=false;
+        normal=[1;0;0];
+        radius=0;
+        for p=1:num_path
+            x=x0(:,k);
+            stime=0;
+            is_exit=false;
+            finished=false;
+            for i=1:epoch
+                if alpha==2
+                    % 曲面局部切平面 WoS 传输近似：左 a=1，右 a=2。
+                    % dt 为平均退出时间上限；界面及时间近似需做 dt 检验。
+                    gap=x(1)-g(x(2),x(3));
+                    near_interface=abs(gap)<=1e-6;
+                    if near_interface
+                        [x,normal]=surface_projection(x,g,gp_y,gp_z);
+                        if ~inside_domain(shp,x)
+                            is_exit=true;
+                            finished=true;
+                            break;
+                        end
+                        a=1.5;
+                        radius=sqrt(2*n*a*dt);
+                    elseif gap<0
+                        a=1;
+                        radius=min(sqrt(2*n*a*dt),abs(gap)/sqrt(1+(0.4+0.3*pi)^2));
+                    else
+                        a=2;
+                        radius=min(sqrt(2*n*a*dt),abs(gap)/sqrt(1+(0.4+0.3*pi)^2));
+                    end
+                    tau_q=radius^2/(2*n*a);
+                else
+                    tau_q=dt;
+                end
+
+                if beta==1
+                    s_next=stime+tau_q;
+                else
+                    s_next=stime+rand_stable(beta,1,tau_q);
+                end
+                if s_next>T
+                    finished=true;
+                    break; % 时间终止且未出界，贡献初值。
+                end
+
+                if alpha==2
+                    direction=randn(3,1);
+                    direction=direction/norm(direction);
+                    if near_interface
+                        % 均匀半球采样，右侧概率 2/3，左侧概率 1/3。
+                        if dot(direction,normal)<0
+                            direction=direction-2*dot(direction,normal)*normal;
+                        end
+                        if rand>=2/3
+                            direction=direction-2*dot(direction,normal)*normal;
+                        end
+                    end
+                    x=x+radius*direction;
+                    if ~inside_domain(shp,x)
+                        is_exit=true;
+                        finished=true;
+                        break;
+                    end
+                elseif x(1)<=g(x(2),x(3))
+                    % 局部布朗步：外边界吸收，内部曲面保持法向反射。
+                    direction=randn(3,1);
+                    direction=direction/norm(direction);
+                    z=x+H(rand,alpha1,r1)*direction;
+                    if ~inside_domain(shp,z)
+                        is_exit=true;
+                        finished=true;
+                        break;
+                    end
+                    z=reflect_interface(z,g,gp_y,gp_z,shp);
+                    if ~inside_domain(shp,z)
+                        is_exit=true;
+                        finished=true;
+                        break;
+                    end
+                    direction=randn(3,1);
+                    direction=direction/norm(direction);
+                    y_cand=z+H(rand,alpha,r)*direction;
+                    if inside_domain(shp,y_cand) && y_cand(1)>g(y_cand(2),y_cand(3))
+                        x=y_cand;
+                    else
+                        x=z; % 辅助跳跃出界时拒绝，不杀死主路径。
+                    end
+                else
+                    % 非局部完整跳跃出界时吸收。
+                    direction=randn(3,1);
+                    direction=direction/norm(direction);
+                    b=x+H(rand,alpha,r)*direction;
+                    if ~inside_domain(shp,b)
+                        is_exit=true;
+                        finished=true;
+                        break;
+                    elseif b(1)<=g(b(2),b(3))
+                        x=b;
+                    else
+                        direction=randn(3,1);
+                        direction=direction/norm(direction);
+                        y_cand=b+H(rand,alpha,r)*direction;
+                        if inside_domain(shp,y_cand) && y_cand(1)>g(y_cand(2),y_cand(3))
+                            x=y_cand;
+                        else
+                            x=b; % 第二份区内跳跃出界时只拒绝。
+                        end
+                    end
+                end
+                stime=s_next;
+            end
+            if ~finished
+                error('路径达到 epoch 上限，不能作为完整样本累加。');
+            end
+            if ~is_exit
+                sol_stoc_new=sol_stoc_new+u0;
+            end
+        end
+        sol_time(k)=sol_stoc_new/num_path;
+    end
+    solution(j,:)=sol_time';
+    u_num{j}=reshape(sol_time,grid_size);
+    fprintf('beta=%.2f completed.\n',beta);
+end
+toc;
+assert(all(isfinite(solution(:))) && all(solution(:)>=0 & solution(:)<=u0));
+
+% 四图共用色标，不人为指定图片中的数值范围。
+inside_values=solution(:,inside_start);
+clim=[min(inside_values(:)),max(inside_values(:))];
+if clim(1)==clim(2)
+    clim=[0,u0];
+end
+figure('Color','w','Position',[100 100 1400 400]);
+layout=tiledlayout(1,numel(beta_list),'TileSpacing','compact','Padding','compact');
+for j=1:numel(beta_list)
+    nexttile;
+    u_slice=u_num{j}(:,:,iz);
+    u_slice(~mask(:,:,iz))=NaN;
+    h_img=imagesc(x_grid,y_grid,u_slice,clim);
+    set(h_img,'AlphaData',double(mask(:,:,iz)));
+    set(gca,'YDir','normal','Color','w','TickLabelInterpreter','latex');
+    title(sprintf('$\\beta=%.2f$',beta_list(j)),'Interpreter','latex');
+    xlabel('$x$','Interpreter','latex'); ylabel('$y$','Interpreter','latex');
+    axis square; xlim([-1,1]); ylim([-1,1]);
+end
+colormap(jet);
+cb=colorbar; cb.Layout.Tile='east';
+
+function inside=inside_domain(shp,x)
+if any(~isfinite(x)) || any(abs(x)>1)
+    inside=false;
+else
+    inside=inShape(shp,x(1),x(2),x(3));
+end
+end
+
+function [point,normal]=surface_projection(x,g,gp_y,gp_z)
+zb=x(3);
+distance=@(y) (x(1)-g(y,zb)).^2+(x(2)-y).^2;
+yb=fminbnd(distance,-1,1);
+point=[g(yb,zb);yb;zb];
+normal=[1;-gp_y(yb,zb);-gp_z(yb,zb)];
+normal=normal/norm(normal);
+end
+
+function x=reflect_interface(x,g,gp_y,gp_z,shp)
+for it=1:50
+    if x(1)<=g(x(2),x(3))
+        return;
+    end
+    [point,normal]=surface_projection(x,g,gp_y,gp_z);
+    x=x-2*dot(x-point,normal)*normal-1e-10*normal;
+    if ~inside_domain(shp,x)
+        return;
+    end
+end
+error('曲面反射未返回局部区，需减小 dt。');
+end
+
+function shp=make_domain()
+% 逐项保留原 coupleshape3d 的点云定义，包括其连接部分。
+d=1.2; R=0.4;
+[Theta,Phi]=meshgrid(linspace(0,2*pi,50),linspace(0,pi,50));
+left_x=-d/2+R*sin(Phi).*cos(Theta);
+right_x=d/2+R*sin(Phi).*cos(Theta);
+ball_y=R*sin(Phi).*sin(Theta); ball_z=R*cos(Phi);
+[Theta_cyl,Z_cyl]=meshgrid(linspace(0,2*pi,50),linspace(-0.2,0.2,30));
+cyl_x=0.2*cos(Theta_cyl); cyl_y=0.2*sin(Theta_cyl);
+P=[left_x(:),ball_y(:),ball_z(:);right_x(:),ball_y(:),ball_z(:); ...
+    cyl_x(:),cyl_y(:),Z_cyl(:)];
+shp=alphaShape(unique(P,'rows'),0.4);
+end
